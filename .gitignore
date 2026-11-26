@@ -1,0 +1,36 @@
+# Proprietary / generated images and Android binaries
+*.vhdx
+*.raw
+*.img
+*.ext4
+*.erofs
+*.apk
+*.jar
+*.dex
+*.odex
+*.vdex
+*.art
+*.so
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+
+# Signing keys and certificates
+*.pk8
+*.pem
+*.keystore
+*.jks
+
+# Build outputs, caches, and logs
+work/
+out/
+dist/
+build/
+tmp/
+*.log
+*.tmp
+__pycache__/
+*.pyc
+.DS_Store
+Thumbs.db
