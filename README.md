@@ -6,7 +6,7 @@
 
 > 将 **Android 16（AOSP 16 / API 36）** 完整移植至 **Windows Subsystem for Android（WSA 2407）** 的工程化补丁集、镜像打包流水线与技术文档。
 >
-> 无需从零重编完整 AOSP 源码，通过精准的 ELF/DEX 二进制补丁、模块嫁接与 `debugfs` + VHDX 打包流水线，在 Windows 11 原生独立窗口中稳定运行 AOSP 16、官方 x86_64 Google Play（GApps 16）以及官方 A16 原生 `libndk_translation`（Berberis）ARM64 翻译层。
+> 无需从零重编完整 AOSP 源码，通过精准的 ELF/DEX 二进制补丁、模块嫁接、原创 `libhoudini_a16_shim.so` 翻译桥接层与 `debugfs` + VHDX 打包流水线，在 Windows 11 原生独立窗口中稳定运行 AOSP 16、原厂联网、官方 x86_64 Google Play（GApps 16）以及高性能 Intel Houdini 14.0.0（全 ABI `arm64-v8a` + `armeabi-v7a`）。
 
 ---
 
@@ -17,9 +17,10 @@
 | **原生多窗口合成（HWC 2.4 + SF）** | [`patch_hwc_taskid.py`](tools/patches/patch_hwc_taskid.py) + [`patch_services_taskid.py`](tools/patches/patch_services_taskid.py) | 打通 AOSP 16 `SurfaceFlinger` → `hwcomposer.windows.so` 的 `org.chromium.arc.V1_0.TaskId`（`METADATA_TASK_ID = 3`）像素层透传，实现 Windows 11 主桌面原生独立自由窗口渲染与双向焦点同步。 |
 | **WSA Shell 与通知桥接** | [`build_systemui_wsa.py`](tools/patches/build_systemui_wsa.py) | 将 `WsaTaskManager`、`Shell` 与 `Notification` RCM 通道嫁接至原生 A16 `SystemUI.apk`（`com/google/protobuf/` 原地重命名隔离为 `com/google/protobuw/`），全量 **5 个 Binder 服务** 与 **25 条 RCM 通道** 在线。 |
 | **消除 A16 双标题栏** | [`patch_systemui_nocaption.py`](tools/patches/patch_systemui_nocaption.py) | 禁用 A16 `CaptionWindowDecorViewModel.shouldShowWindowDecor$1`，保留原生 Windows 11 标题栏，彻底消除自由窗口多余的 Android 内层标题栏。 |
-| **A16 自由窗口布局与系统兼容** | [`build_services_wsa.py`](tools/patches/build_services_wsa.py) + [`patch_systemapp.py`](tools/patches/patch_systemapp.py) + [`patch_userapp.py`](tools/patches/patch_userapp.py) | 重写纯 A16 `WsaLaunchParamsModifier`；修复 `SystemApp`（P1–P6，含 A16 6 参数 `OnOpNotedListener`）与 `UserApp`（禁用后台清理权限崩溃 + 原生桌面 `ACTION_MAIN` 兜底）。 |
+| **A16 原生联网与系统兼容** | [`build_services_wsa.py`](tools/patches/build_services_wsa.py) + [`patch_systemapp.py`](tools/patches/patch_systemapp.py) + [`patch_userapp.py`](tools/patches/patch_userapp.py) | 重写纯 A16 `WsaLaunchParamsModifier`；`SystemApp` P5 精准改为 NOP `setNetworkCapabilities`（保留 `EthernetManager.updateConfiguration()`，绕过 A16 `EthernetServiceImpl.enforceAutomotiveDevice()` 校验，恢复 `eth0` 原生 IPv4/DNS 与 `VALIDATED` 联网）；修复 A16 6 参数 `OnOpNotedListener` 与原生桌面 `ACTION_MAIN` 兜底。 |
+| **Intel Houdini 14.0.0 A16 兼容桥（推荐）** | [`houdini_a16_shim.c`](tools/nativebridge/houdini_a16_shim.c) + [`pack_houdini_shim.sh`](tools/pack/pack_houdini_shim.sh) | 原创 11 KB 纯 C **NativeBridge v8 → v6 兼容层**（零改动 `libart.so` / `libhoudini.so`）：① 补齐 A16 ART `getTrampolineForFunctionPointer`（v7）与 `isNativeBridgeFunctionPointer`（v8），根治 `CHECK(native_method != nullptr)` `SIGABRT`；② 运行时动态解析 A16 ThinLTO `linker64` 中被加上 `.llvm.<hash>` 后缀的 `__dl__ZL6solist` 与 `__dl__ZL12g_cfi_shadow`，根治 guest `mprotect()` `SIGSEGV`。完整保留原厂 Houdini 14.0.0 高性能与 64/32 位 ARM（`arm64-v8a` + `armeabi-v7a`）全兼容。 |
+| **可选：原生 A16 Berberis 翻译层** | [`pack_ndk_translation.sh`](tools/pack/pack_ndk_translation.sh) | 作为备选方案，也可从官方 Android 16 SDK `system.img` 注入原生 `libndk_translation.so`（Berberis，仅 64 位 `arm64-v8a`）。 |
 | **官方 A16 x86_64 GApps** | [`pack_gapps16.sh`](tools/pack/pack_gapps16.sh) | 直接从官方 Android 16 SDK `google_apis_playstore/x86_64/system.img` 提取原生 x86_64 API 36 GApps 7 件套（`GmsCore`、`Phonesky`、`GSF` 等）与完整权限/sysconfig/default-permissions。 |
-| **原生 A16 ARM64 翻译层（Berberis）** | [`pack_ndk_translation.sh`](tools/pack/pack_ndk_translation.sh) | 用官方 Android 16 原生 `libndk_translation.so` / Berberis + `binfmt_misc` 替换跨代不兼容的 A13 Houdini，根治 arm64-v8a 应用在 A16 ART `ClassLinker::RegisterNative` 触发 `CHECK(native_method != nullptr)` `SIGABRT` 崩溃。 |
 | **`fuse-bpf` 跨代内核修复** | [`post_boot_fixes.ps1`](tools/deploy/post_boot_fixes.ps1) | 通过持久化属性 `persist.sys.fuse.bpf.override=false` 解决 WSA A13 内核与 A16 `vold`/`FuseDaemon` 冲突，恢复所有应用对自有 `/Android/data` 与 `/Android/obb` 的正常读写。 |
 | **开始菜单直达原生桌面** | [`create_desktop_shortcut.ps1`](tools/deploy/create_desktop_shortcut.ps1) | 配合 `UserApp` `ACTION_MAIN` 补丁与禁用 `SecondaryDisplayLauncher`，在 Windows 开始菜单一键直达 AOSP 16 原生 Launcher3 桌面。 |
 | **零拷贝 VHDX 工具集** | [`tools/vhdx/`](tools/vhdx/) | 纯 Python 实现动态/固定 VHDX 解包（`vhdx_extract.py`）、16 MiB 块重打包与反解 MD5 校验（`raw2vhdx.py`），以及支持动态 VHDX `chunk_ratio` 的零拷贝 FUSE3 只读挂载器（`vhdx_fuse_ro.py`）。 |
@@ -48,9 +49,12 @@ WSA-AOSP16/
     │   ├── patch_systemui_nocaption.py      # 禁用 A16 自由窗口内层双标题栏
     │   ├── patch_systemapp.py               # SystemApp.apk A16 兼容补丁（P1–P6）
     │   └── patch_userapp.py                 # UserApp.apk 权限修复 + 原生桌面 ACTION_MAIN 兜底
+    ├── nativebridge/
+    │   └── houdini_a16_shim.c               # 原创 A16 NativeBridge v8->v6 + ThinLTO linker64 兼容层
     ├── pack/
     │   ├── pack_gapps16.sh                  # 从官方 Android 16 SDK 镜像注入 x86_64 GApps 16
-    │   └── pack_ndk_translation.sh          # 从官方 Android 16 SDK 镜像注入 Berberis / libndk_translation
+    │   ├── pack_houdini_shim.sh             # 注入 libhoudini_a16_shim.so（保留原厂 Intel Houdini 14.0.0）
+    │   └── pack_ndk_translation.sh          # 可选：注入 Berberis / libndk_translation（纯 64 位）
     └── deploy/
         ├── deploy_wsa_images.ps1            # 安全部署 system.vhdx / vendor.vhdx（自动备份 + MD5 校验）
         ├── post_boot_fixes.ps1              # 首次开机后应用 fuse-bpf 修复与禁用 SecondaryDisplayLauncher
@@ -123,25 +127,41 @@ python3 tools/patches/patch_userapp.py \
   --key platform.pk8 --cert platform.x509.pem
 ```
 
-### 2. 注入官方 GApps 16 与原生 ARM64 翻译层（WSL2）
+### 2. 编译 `libhoudini_a16_shim.so` 并打包镜像（推荐方案）
 
-将上述组件通过 `debugfs` 写入基础 AOSP 16 `system.vhdx` / `vendor.vhdx` 后，继续注入 GApps 16 与 `libndk_translation`（Berberis）：
+使用 Android NDK（r27+）交叉编译 64 位与 32 位兼容桥（纯 C，无外部依赖，体积 ~11 KB）：
 
 ```bash
-# 注入官方 Android 16 x86_64 GApps 7 件套 + 权限配置
+"$ANDROID_NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/clang" \
+  --target=x86_64-linux-android35 -shared -fPIC -O2 -Wall -Wextra -fvisibility=hidden \
+  -Wl,-soname,libhoudini_a16_shim.so -o libhoudini_a16_shim_64.so \
+  tools/nativebridge/houdini_a16_shim.c -ldl -llog
+
+"$ANDROID_NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/clang" \
+  --target=i686-linux-android35 -shared -fPIC -O2 -Wall -Wextra -fvisibility=hidden \
+  -Wl,-soname,libhoudini_a16_shim.so -o libhoudini_a16_shim_32.so \
+  tools/nativebridge/houdini_a16_shim.c -ldl -llog
+```
+
+随后在 WSL2 中注入官方 GApps 16 与 `libhoudini_a16_shim.so`（如需改用 Berberis，可执行 `pack_ndk_translation.sh`）：
+
+```bash
+# 1) 注入官方 Android 16 x86_64 GApps 7 件套 + 权限配置
 sudo bash tools/pack/pack_gapps16.sh \
   --in-system system-aosp16-base.vhdx \
   --sdk-image "/mnt/c/.../Android/Sdk/system-images/android-36/google_apis_playstore/x86_64/system.img" \
   --out-system system-aosp16-gapps.vhdx \
   --userapp UserApp.patched.apk
 
-# 用官方 A16 libndk_translation (Berberis) 替换 A13 Houdini
-sudo bash tools/pack/pack_ndk_translation.sh \
+# 2) 注入 Intel Houdini 14.0.0 NativeBridge v8 Shim + SystemApp 联网修复补丁（推荐）
+sudo bash tools/pack/pack_houdini_shim.sh \
   --in-system system-aosp16-gapps.vhdx \
   --in-vendor vendor-hwc-patched.vhdx \
-  --sdk-image "/mnt/c/.../Android/Sdk/system-images/android-36/google_apis_playstore/x86_64/system.img" \
-  --out-system system-aosp16-ndk.vhdx \
-  --out-vendor vendor-aosp16-ndk.vhdx
+  --shim64 libhoudini_a16_shim_64.so \
+  --shim32 libhoudini_a16_shim_32.so \
+  --systemapp SystemApp.patched.apk \
+  --out-system system-aosp16-r43.vhdx \
+  --out-vendor vendor-aosp16-r43.vhdx
 ```
 
 ### 3. 部署、首次开机修复与开始菜单快捷方式（Windows PowerShell）
@@ -167,14 +187,15 @@ sudo bash tools/pack/pack_ndk_translation.sh \
 - **冷启动速度**：约 `18s – 26s` 到达 `sys.boot_completed=1`，零 `HeartbeatTimeout`、零 `FATAL EXCEPTION` / `Fatal signal`
 - **WSA 集成完整度**：5/5 WSA Binder 服务在线、25/25 RCM 通道建链（含 `Composition`、`Shell`、`Notification`、`TSF` 中文输入法、`Clipboard`、`Audio` 等）
 - **窗口与输入体验**：Windows 11 主桌面原生独立自由窗口，单标题栏，支持 Windows 宿主中文输入法（TSF）与开始菜单一键直达原生桌面
-- **应用生态与兼容**：官方 A16 x86_64 Google Play 服务就绪；64 位 ARM64（`arm64-v8a`）大型应用在 Berberis 翻译层下稳定运行，`0 SIGABRT`；`Android/data` 与 `Android/obb` 权限正常（`FuseDaemon: Rejected = 0`）
+- **原生网络与网页**：`eth0` 开机自动下发 IPv4/网关/DNS，`ConnectivityService` 1 秒内 `VALIDATED`，`WebView` 网页浏览与 Google Play 联网正常
+- **应用生态与兼容**：官方 A16 x86_64 Google Play 服务就绪；Intel Houdini 14.0.0 经 `libhoudini_a16_shim.so` 桥接后完整支持 `arm64-v8a` 与 `armeabi-v7a`，大型 Unity ARM64 游戏（含腾讯 `libtersafe2.so`/`libtprt.so` 与数美 `libsmsdk.so` 反作弊组件）稳定运行，`0 SIGABRT` / `0 SIGSEGV`；`Android/data` 与 `Android/obb` 权限正常（`FuseDaemon: Rejected = 0`）
 
 ---
 
 ## 已知限制与注意事项
 
 1. **正确启动方式**：请始终通过 Windows 开始菜单快捷方式或 MSIX `AppExecutionAlias`（`WsaClient.exe /launch wsa://<package>`）启动；勿直接双击安装目录内 `WsaClient\WsaClient.exe`（缺少 MSIX 依赖上下文）。
-2. **ARM 翻译架构范围**：`pack_ndk_translation.sh` 默认仅启用 **64 位 `arm64-v8a`** 原生翻译（`x86_64,x86,arm64-v8a`），不包含 32 位 `armeabi-v7a` 翻译器。
+2. **ARM 翻译层选择**：默认推荐 **`libhoudini_a16_shim.so` + 原厂 Intel Houdini 14.0.0**（同时支持 `arm64-v8a` 与 `armeabi-v7a`，性能与反作弊兼容性最佳）；`pack_ndk_translation.sh`（Berberis）仅保留作为可选纯 64 位替代方案。
 3. **补丁字节偏移绑定**：`tools/patches/` 中的绝对偏移均带有严格的字节前置断言（`assert`），针对 WSA `2407.40000.4.0`（x64）与 AOSP 16 `BP2A.250605.031.A2` 校验；若用于其他版本，需重新核对对应符号偏移。
 4. **中文输入法提示**：请在 Android 系统设置中启用 WSA 宿主键盘/输入法通道（`TSF` RCM 通道），即可直接复用 Windows 11 原生中文输入法。
 

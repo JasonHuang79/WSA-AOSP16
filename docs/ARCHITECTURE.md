@@ -43,20 +43,32 @@ WSA 在 Windows 11 上为每个 Android 应用渲染原生独立桌面窗口，�
 ## 3. SystemApp / UserApp / services.jar 适配
 
 - **`services.jar`（`tools/patches/build_services_wsa.py`）**：剔除跨代不兼容的 A13 `WsaLaunchParamsModifier*`，编译注入纯 A16 `WsaLaunchParamsModifier`（标准应用默认 `WINDOWING_MODE_FREEFORM = 5` 与居中初始窗口边界）。
-- **`SystemApp.apk`（`tools/patches/patch_systemapp.py`）**：对 `classes.dex` 施加 P1–P6 共 6 处 6 字节 NOP，重点消除 A16 `AppOpsManager.OnOpNotedListener.onOpNoted` 签名扩展至 6 参数导致的 `AbstractMethodError`。
+- **`SystemApp.apk`（`tools/patches/patch_systemapp.py`）**：
+  - 对 `classes.dex` 施加 P1–P6 补丁，重点包括：
+    - **P5 `@ 0x09ef98`（8B NOP，原生联网修复）**：AOSP 16 `EthernetServiceImpl.updateConfiguration()` 仅在 `request.getNetworkCapabilities() != null` 时调用 `enforceAutomotiveDevice()` 抛异常；若 `capabilities == null`，则只校验常规网络管理权限（`SystemApp` 已持有）。早期粗暴 NOP 掉整个 `EthernetManager.updateConfiguration()` 会导致 `eth0` 无 IPv4 断网；改为仅 NOP `setNetworkCapabilities` + `move-result-object v8`（8 字节 `@ 0x09ef98`）后，`eth0` 立即正常获得宿主机分配的静态 IPv4、网关与 DNS，`ConnectivityService` 1 秒内进入 `VALIDATED`。
+    - **P6 `@ 0x0df780`（6B NOP）**：消除 A16 `AppOpsManager.OnOpNotedListener.onOpNoted` 签名扩展至 6 参数导致的 `AbstractMethodError`。
 - **`UserApp.apk`（`tools/patches/patch_userapp.py`）**：
   - `classes3.dex @ 0x1a4240`：将 `persist.sys.disable_cache_cleanup` 默认值从 `false` 改为 `true`，避免 `/launch` 时 `killAllBackgroundProcesses` 权限异常；
   - `classes3.dex @ 0x1d7224`：在 `IntentRedirectionHandler.handleLaunchPackage` 中为无 `CATEGORY_LAUNCHER` 的应用（如 `com.android.launcher3`）补齐 `new Intent(Intent.ACTION_MAIN).setPackage(pkg)` 兜底，使 Windows 开始菜单快捷方式可直接唤醒原生 Android 桌面。
 
 ---
 
-## 4. 官方 A16 x86_64 GApps 与 Berberis 原生 ARM64 翻译层
+## 4. 官方 A16 x86_64 GApps 与 Intel Houdini 14.0.0 A16 兼容桥
 
 1. **GApps 16（`tools/pack/pack_gapps16.sh`）**
    - 从官方 Android 16 SDK `google_apis_playstore/x86_64/system.img` 的 `super` 分区只读挂载 `product` 与 `system_ext` EROFS，仅提取 7 个原生 x86_64 API 36 特权 APK（跳过与目标 `bootclasspath` 不匹配的模拟器 `oat/` 预编译产物）及完整 `permissions`、`sysconfig`、`default-permissions`。
-2. **替换 A13 Houdini 为 A16 原生 `libndk_translation` / Berberis（`tools/pack/pack_ndk_translation.sh`）**
-   - **根因**：A13 Intel Houdini 在向 A16 ART 转发 `JNIEnv->RegisterNatives` 时会对部分方法解析出 `nullptr`。A13 ART 仅记日志跳过，而 A16 ART 的 `ClassLinker::RegisterNative` 将其提升为硬断言 `CHECK(native_method != nullptr)`，导致所有 `arm64-v8a` 应用必然 `SIGABRT`。
-   - **方案**：从官方 Android 16 SDK `system.img` 提取整套 API 36 `libndk_translation.so`、`libberberis_exec_region.so`、21 个 `libndk_translation_proxy_*.so`、57 个 guest `arm64/*.so`、`arm64/{linker64,app_process64}`、`ndk_translation_program_runner_binfmt_misc_arm64`、`binfmt_misc/{arm64_exe,arm64_dyn}`、`ld.config.arm64.txt` 并编写精简 64-bit `ndk_translation.rc`；同时修改 `system/build.prop` 与 `vendor/build.prop` 禁用 A13 Houdini 并启用 `ro.dalvik.vm.native.bridge=libndk_translation.so`。
+2. **Intel Houdini 14.0.0 原生兼容桥 `libhoudini_a16_shim.so`（推荐，`tools/nativebridge/houdini_a16_shim.c`）**
+   - 经深度逆向证实，原厂 WSA 的 Intel Houdini `14.0.0_z.GoogleGame_com1.3 RELEASE` 在 AOSP 16 上存在**两处精确跨代不兼容**，均可在**零改动 `com.android.art.capex` / `libart.so` / `libhoudini.so`**的前提下由一个 ~11 KB 纯 C Shim 彻底解决：
+     1. **NativeBridge v6 → v8 ABI 缺口（`RegisterNatives` `SIGABRT`）**：
+        - AOSP 16 `art::JNI::RegisterNatives` 对所有 native-bridge 进程无条件调用 v7 `NativeBridgeGetTrampolineForFunctionPointer`（槽位 `+0x98`）并探测 v8 `NativeBridgeIsNativeBridgeFunctionPointer`（槽位 `+0xa0`）。
+        - Houdini 14.0.0 仅导出 v6 `NativeBridgeItf`，导致 `libnativebridge.so` 报错 `not compatible with version 7` 并返回 `nullptr`，覆盖掉 Houdini 自己早已在 `JNIEnv->RegisterNatives` 代理中包装好的合法 x86_64 host trampoline 指针，进而触发 `ClassLinker::RegisterNative` 的 `CHECK(native_method != nullptr)` 崩溃。
+        - **解法**：`libhoudini_a16_shim.so` 导出 v8 `NativeBridgeItf`（`0xa8` 字节），透传 v1–v6 全部 17 个回调至原厂 `libhoudini.so`，将 v7 `getTrampolineWithJNICallType`（`+0x90`）转发至 `real->getTrampoline`，在 v7 `getTrampolineForFunctionPointer`（`+0x98`）中恒等返回 `method`，在 v8 `isNativeBridgeFunctionPointer`（`+0xa0`）返回 `false`。
+     2. **AOSP 16 x86_64 `linker64` ThinLTO 符号后缀（`mprotect()` `SIGSEGV (SI_KERNEL)`）**：
+        - Houdini 14.0.0 在处理 guest `mprotect()` 系统调用时，会检查目标地址是否落在宿主机 x86_64 动态库内，为此需要读取 `/apex/com.android.runtime/bin/linker64` 的 `.symtab` 查找 `__dl__ZL6solist` 与 `__dl__ZL12g_cfi_shadow`。
+        - AOSP 16 x86_64 `linker64` 启用了 ThinLTO，这两个静态符号被重命名为 `__dl__ZL6solist.llvm.<hash>` 与 `__dl__ZL12g_cfi_shadow.llvm.<hash>`（而 32 位 `linker` 无此后缀）。Houdini 精确匹配失败返回 `0`，随后在 `mprotect()` 时解引用 `*(linker64_base + 0)` 读到 ELF 魔数 `0x00010102464c457f`（`\x7fELF...`）引发非规范地址 `SIGSEGV (SI_KERNEL)`。
+        - **解法**：`libhoudini_a16_shim.so` 在加载 `libhoudini.so` 后，经严格 rodata 字符串与指令字节签名校验，动态解析当前系统 `linker64` 的 `.symtab`（兼容精确名与 `.llvm.*` 后缀），将 Houdini 内部两处 5 字节 `callq` 符号查询指令在内存中原地替换为返回真实偏移的 5 字节 `movl $imm32, %eax`（且 AOSP 16 `soinfo` 的 `base(+0x10)` / `size(+0x18)` / `next(+0x28)` 布局与 A13 完全一致）。
+3. **备选：A16 原生 `libndk_translation` / Berberis（`tools/pack/pack_ndk_translation.sh`）**
+   - 如需纯 AOSP 16 官方开源翻译层，可使用 `pack_ndk_translation.sh` 从 Android 16 SDK `system.img` 注入 Berberis（仅支持 64 位 `arm64-v8a`，部分第三方反作弊/风控 SDK 如数美 `libsmsdk.so` 在 Berberis 下可能存在线程栈边界兼容性问题）。
 
 ---
 

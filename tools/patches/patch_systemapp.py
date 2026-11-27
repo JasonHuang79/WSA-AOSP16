@@ -6,7 +6,9 @@ Patches applied to classes.dex:
   - P2 @ 0x0a1dec: AmazonRedirectionHandler.registerReceiver (6B NOP)
   - P3 @ 0x0b45a4: AppsRedirectionHandler.registerReceiver (6B NOP)
   - P4 @ 0x0e1146: SettingsRedirectionHandler.setDevMode (6B NOP)
-  - P5 @ 0x09f0d0: NetworkManager.updateNetwork (6B NOP)
+  - P5 @ 0x09ef98: NetworkManager.updateNetwork -> EthernetNetworkUpdateRequest.Builder.setNetworkCapabilities
+                   (8B NOP: omits capabilities while keeping EthernetManager.updateConfiguration(), bypassing
+                    AOSP 16 EthernetServiceImpl.enforceAutomotiveDevice() so eth0 receives native IPv4/GW/DNS)
   - P6 @ 0x0df780: PermissionUsage.startWatchingNoted (6B NOP; avoids A16 6-arg OnOpNotedListener AbstractMethodError)
 
 Usage:
@@ -29,7 +31,7 @@ PATCHES = [
     ("P2 AmazonRedirectionHandler.registerReceiver", 0x0A1DEC, "6e306c002100"),
     ("P3 AppsRedirectionHandler.registerReceiver", 0x0B45A4, "6e306c002100"),
     ("P4 SettingsRedirectionHandler.setDevMode", 0x0E1146, "6e40bf001243"),
-    ("P5 NetworkManager.updateNetwork", 0x09F0D0, "6e5a130150a9"),
+    ("P5 NetworkManager.updateNetwork (omit setNetworkCapabilities, keep updateConfiguration)", 0x09EF98, "6e20170198000c08"),
     ("P6 PermissionUsage.startWatchingNoted (A16)", 0x0DF780, "6e3042002005"),
 ]
 
@@ -58,10 +60,10 @@ def main():
 
     for label, off, exp_hex in PATCHES:
         exp = bytes.fromhex(exp_hex)
-        got = bytes(dex[off : off + 6])
+        got = bytes(dex[off : off + len(exp)])
         assert got == exp, f"{label} @ 0x{off:x} mismatch: got={got.hex()} exp={exp_hex}"
-        dex[off : off + 6] = b"\x00" * 6
-        print(f"  [PATCHED] {label} @ 0x{off:x}")
+        dex[off : off + len(exp)] = b"\x00" * len(exp)
+        print(f"  [PATCHED] {label} @ 0x{off:x} ({len(exp)}B NOP)")
 
     dex[12:32] = hashlib.sha1(dex[32:]).digest()
     dex[8:12] = (zlib.adler32(dex[12:]) & 0xFFFFFFFF).to_bytes(4, "little")
@@ -70,7 +72,12 @@ def main():
         work = pathlib.Path(td)
         dex_out = work / "classes.dex"
         dex_out.write_bytes(dex)
-        r = subprocess.run([tool_exe(args.build_tools, "dexdump"), "-d", str(dex_out)], capture_output=True, text=True, errors="replace")
+        r = subprocess.run(
+            [tool_exe(args.build_tools, "dexdump"), "-d", str(dex_out)],
+            capture_output=True,
+            text=True,
+            errors="replace",
+        )
         assert r.returncode == 0, f"dexdump failed: {r.stderr[:400]}"
 
         unsigned_apk = work / "unsigned.apk"
@@ -87,17 +94,28 @@ def main():
                 ni.external_attr = info.external_attr
                 zout.writestr(ni, bytes(dex) if fn == "classes.dex" else payload)
 
-        subprocess.run([tool_exe(args.build_tools, "zipalign"), "-f", "-p", "4", str(unsigned_apk), str(aligned_apk)], check=True)
+        subprocess.run(
+            [tool_exe(args.build_tools, "zipalign"), "-f", "-p", "4", str(unsigned_apk), str(aligned_apk)],
+            check=True,
+        )
         subprocess.run(
             [
-                tool_exe(args.build_tools, "apksigner"), "sign",
-                "--key", str(args.key),
-                "--cert", str(args.cert),
-                "--min-sdk-version", "33",
-                "--v1-signing-enabled", "true",
-                "--v2-signing-enabled", "true",
-                "--v3-signing-enabled", "true",
-                "--out", str(args.output),
+                tool_exe(args.build_tools, "apksigner"),
+                "sign",
+                "--key",
+                str(args.key),
+                "--cert",
+                str(args.cert),
+                "--min-sdk-version",
+                "33",
+                "--v1-signing-enabled",
+                "true",
+                "--v2-signing-enabled",
+                "true",
+                "--v3-signing-enabled",
+                "true",
+                "--out",
+                str(args.output),
                 str(aligned_apk),
             ],
             check=True,
