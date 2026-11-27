@@ -24,6 +24,17 @@ WSA 在 Windows 11 上为每个 Android 应用渲染原生独立桌面窗口，�
    - **修复方案（`tools/patches/patch_services_taskid.py`）**：
      - 在 `services.jar` `classes3.dex` 的 `WindowStateAnimator.createSurfaceLocked @ 0x156340` 原地替换 30 字节 Dalvik 字节码：调用 `WindowState.getTask()` 读取 `Task.mTaskId`，并通过 `SurfaceControl.Builder.setMetadata(3 /* METADATA_TASK_ID */, taskId)` 直接将 `taskId` 写入每个像素层。
 
+3. **`SurfaceView` / BLAST 子图层不递归继承 `METADATA_TASK_ID`（r44，`tools/patches/patch_sf_metadata_inherit.py`）**
+   - **现象**：`Task` 顶层窗口本身能正常出窗，但应用自建的子 `SurfaceView`（BLAST 合成路径）——典型如 Unity 游戏、视频播放器、GL 渲染面——在 Windows 11 独立窗口内**黑屏 / 完全不显示**；`dumpsys SurfaceFlinger` 中这些子层的 `mTaskId` 恒为 `0`。
+   - **根因**：AOSP 16 `LayerSnapshotBuilder::updateMetadata`（被内联进 `LayerSnapshotBuilder::updateSnapshot` 的 **3 条**路径）在填充 GenericMetadata 时，只用**本图层**的 `requested.metadata`（其 `mMap` 位于 `+0x148`）做 key 查表；父快照的 `parentSnapshot.layerMetadata` 要等到循环**结束之后**、且 `args.includeMetadata == true` 时，才被合并进 `snapshot.layerMetadata`（`+0x4e8`）。也就是说"继承"发生在"查表之后"：子图层在查表阶段永远看不到父容器 `Task` 上的 `org.chromium.arc.V1_0.TaskId`，`mTaskId` 保持 `0`，最终被 `hwcomposer.windows.so` 的 `Layer::validate()` 当作无窗口图层丢弃，于是即使 HWC 侧的 key 探测（见本节第 1 条）与窗口侧 `setMetadata`（第 2 条）都已修好，`SurfaceView` 仍然不透传、不出画。
+   - **二进制补丁原理**（在 `.text` 尾部对齐空白处挖 code cave，**不移动任何节区、不新增节、不需要重定位表**）：
+     1. **cave 选址**：VMA `0x79f900`，位于 R-X `PT_LOAD`（`p_vaddr = 0x198000`）末尾的对齐填充中，原始内容全零。因此只需把该段的 `p_filesz` / `p_memsz` 由 `0x6078c0` 扩到 `0x607ac0`（仍落在 `0x7a0000` 页边界内），即可让 cave 成为合法可执行映射。
+     2. **`merge_meta_helper(rdi=snapshot, rsi=parentSnapshot, rdx=req_meta)`**：先 `push` 全部 11 个寄存器（`rbx`、`r14`、`rax`、`rcx`、`rdx`、`rsi`、`rdi`、`r8`–`r11`；含返回地址共 96 B，恰好满足 16 字节栈对齐），随后执行 `snapshot->layerMetadata = parentSnapshot->layerMetadata`（PLT `LayerMetadata::operator= @ 0x79cc60`）与 `snapshot->layerMetadata.merge(requested.metadata, /*inherit=*/false)`（PLT `LayerMetadata::merge @ 0x79cdb0`），最后逆序 `pop` 并 `retq`。helper 对调用方**零寄存器副作用**，且 `parentSnapshot == nullptr` 时直接跳过。
+     3. **3 个 trampoline**（`path1_tramp` / `path2_tramp` / `path3_tramp`）：分别接管 `0x1a3702`、`0x1a3872`、`0x1a548a` 三条路径上原本的 `leaq 0x1d8(%r12), %rbx|%r14` 指令——先原样重放该指令，再按各路径不同的寄存器约定取出 `snapshot`（`%r12`）、`parentSnapshot`（`%r11` / `%rbx` / `-0x148(%rbp)`）与 `req_meta`（`-0x170(%rbp)` / `-0x158(%rbp)`），`call` helper 后 `retq`。这样"继承"被提前到查表**之前**完成。
+     4. **查表基址重定向**：把 3 处 GenericMetadata 循环的查表基址从 `requested.metadata.mMap`（`+0x148`）改为 `snapshot.layerMetadata.mMap`（`+0x4f0`），位置分别在 `0x1a5e70`、`0x1a5caa`、`0x1a657c`，使循环读到的已是"继承 + 合并"后的 map。
+     5. **去重**：3 条路径末尾原有的 `includeMetadata` 后置合并分支被改写为 `NOP` / 无条件 `jmp`（`0x1a373e`、`0x1a38a4`、`0x1a54e3`），避免与 helper 重复合并。
+   - **安全性**：全部 7 个改写点都带**原始字节断言**（`assert`），任一字节与 `BP2A.250605.031.A2` 基线不符即中止，绝不产出"半补丁"二进制；输出文件附带 MD5 便于部署前后比对。
+
 ---
 
 ## 2. SystemUI 嫁接与双标题栏消除

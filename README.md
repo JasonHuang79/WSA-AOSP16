@@ -6,7 +6,7 @@
 
 > 将 **Android 16（AOSP 16 / API 36）** 完整移植至 **Windows Subsystem for Android（WSA 2407）** 的工程化补丁集、镜像打包流水线与技术文档。
 >
-> 无需从零重编完整 AOSP 源码，通过精准的 ELF/DEX 二进制补丁、模块嫁接、原创 `libhoudini_a16_shim.so` 翻译桥接层与 `debugfs` + VHDX 打包流水线，在 Windows 11 原生独立窗口中稳定运行 AOSP 16、原厂联网、官方 x86_64 Google Play（GApps 16）以及高性能 Intel Houdini 14.0.0（全 ABI `arm64-v8a` + `armeabi-v7a`）。
+> 无需从零重编完整 AOSP 源码，通过精准的 ELF/DEX 二进制补丁、模块嫁接、原创 `libhoudini_a16_shim.so` 翻译桥接层与 `debugfs` + VHDX 打包流水线，在 Windows 11 原生独立窗口中稳定运行 AOSP 16、原厂联网、官方 x86_64 Google Play（GApps 16）以及高性能 Intel Houdini 14.0.0（全 ABI `arm64-v8a` + `armeabi-v7a`），并修复 Unity 游戏 / `SurfaceView` 在独立窗口中的渲染缺失。
 
 ---
 
@@ -15,6 +15,7 @@
 | 模块 | 实现内容 | 解决的核心难题 |
 | :--- | :--- | :--- |
 | **原生多窗口合成（HWC 2.4 + SF）** | [`patch_hwc_taskid.py`](tools/patches/patch_hwc_taskid.py) + [`patch_services_taskid.py`](tools/patches/patch_services_taskid.py) | 打通 AOSP 16 `SurfaceFlinger` → `hwcomposer.windows.so` 的 `org.chromium.arc.V1_0.TaskId`（`METADATA_TASK_ID = 3`）像素层透传，实现 Windows 11 主桌面原生独立自由窗口渲染与双向焦点同步。 |
+| **r44：子图层元数据递归继承（SurfaceView / Unity 独立窗口修复）** | [`patch_sf_metadata_inherit.py`](tools/patches/patch_sf_metadata_inherit.py) | AOSP 16 `LayerSnapshotBuilder::updateMetadata` 只在本图层 `requested.metadata` 中查找 GenericMetadata，父容器 `Task` 上的 `METADATA_TASK_ID` **不会递归继承**到子图层；`SurfaceView`（BLAST）层因此 `mTaskId` 恒为 `0`，被 `hwcomposer.windows.so` 的 `Layer::validate()` 丢弃，表现为 Unity 游戏与视频类 `SurfaceView` 在 Windows 11 独立窗口中黑屏 / 不显示。r44 在 `.text` 尾部 code cave 注入"先继承、再合并"的寄存器全保留 helper，并把 3 条快照路径的 GenericMetadata 查表基址从 `requested.metadata` 改指 `snapshot.layerMetadata`，使子图层完整获得父容器 TaskId。 |
 | **WSA Shell 与通知桥接** | [`build_systemui_wsa.py`](tools/patches/build_systemui_wsa.py) | 将 `WsaTaskManager`、`Shell` 与 `Notification` RCM 通道嫁接至原生 A16 `SystemUI.apk`（`com/google/protobuf/` 原地重命名隔离为 `com/google/protobuw/`），全量 **5 个 Binder 服务** 与 **25 条 RCM 通道** 在线。 |
 | **消除 A16 双标题栏** | [`patch_systemui_nocaption.py`](tools/patches/patch_systemui_nocaption.py) | 禁用 A16 `CaptionWindowDecorViewModel.shouldShowWindowDecor$1`，保留原生 Windows 11 标题栏，彻底消除自由窗口多余的 Android 内层标题栏。 |
 | **A16 原生联网与系统兼容** | [`build_services_wsa.py`](tools/patches/build_services_wsa.py) + [`patch_systemapp.py`](tools/patches/patch_systemapp.py) + [`patch_userapp.py`](tools/patches/patch_userapp.py) | 重写纯 A16 `WsaLaunchParamsModifier`；`SystemApp` P5 精准改为 NOP `setNetworkCapabilities`（保留 `EthernetManager.updateConfiguration()`，绕过 A16 `EthernetServiceImpl.enforceAutomotiveDevice()` 校验，恢复 `eth0` 原生 IPv4/DNS 与 `VALIDATED` 联网）；修复 A16 6 参数 `OnOpNotedListener` 与原生桌面 `ACTION_MAIN` 兜底。 |
@@ -43,6 +44,7 @@ WSA-AOSP16/
     │   └── vhdx_fuse_ro.py                  # 纯 Python FUSE3 零拷贝 VHDX 只读挂载器
     ├── patches/
     │   ├── patch_hwc_taskid.py              # hwcomposer.windows.so ELF 补丁（TaskId 透传）
+    │   ├── patch_sf_metadata_inherit.py     # r44：SurfaceFlinger 子图层 METADATA_TASK_ID 递归继承补丁
     │   ├── build_services_wsa.py            # A16 services.jar + WsaLaunchParamsModifier 构建
     │   ├── patch_services_taskid.py         # WindowStateAnimator.createSurfaceLocked TaskId 补丁
     │   ├── build_systemui_wsa.py            # A16 SystemUI.apk 嫁接 WsaTaskManager/Shell/Notification
@@ -86,6 +88,12 @@ WSA-AOSP16/
 python3 tools/patches/patch_hwc_taskid.py \
   --input hwcomposer.windows.so \
   --output hwcomposer.windows.patched.so
+
+# 1b) r44：修补 A16 system/bin/surfaceflinger（子图层 METADATA_TASK_ID 递归继承，
+#     修复 Unity 游戏 / SurfaceView 在 Windows 11 独立窗口不显示）
+python3 tools/patches/patch_sf_metadata_inherit.py \
+  --input surfaceflinger \
+  --output surfaceflinger.patched
 
 # 2) 构建并修补 A16 services.jar（WsaLaunchParamsModifier + METADATA_TASK_ID）
 python3 tools/patches/build_services_wsa.py \
@@ -187,6 +195,7 @@ sudo bash tools/pack/pack_houdini_shim.sh \
 - **冷启动速度**：约 `18s – 26s` 到达 `sys.boot_completed=1`，零 `HeartbeatTimeout`、零 `FATAL EXCEPTION` / `Fatal signal`
 - **WSA 集成完整度**：5/5 WSA Binder 服务在线、25/25 RCM 通道建链（含 `Composition`、`Shell`、`Notification`、`TSF` 中文输入法、`Clipboard`、`Audio` 等）
 - **窗口与输入体验**：Windows 11 主桌面原生独立自由窗口，单标题栏，支持 Windows 宿主中文输入法（TSF）与开始菜单一键直达原生桌面
+- **r44 子图层渲染**：`SurfaceView`（BLAST）与 Unity 游戏在独立窗口中正常出画。`surfaceflinger` 的 `LayerSnapshotBuilder` 已把父容器 `METADATA_TASK_ID` 递归下发给所有子图层，`mTaskId = 0` 被 HWC 丢弃的情况归零
 - **原生网络与网页**：`eth0` 开机自动下发 IPv4/网关/DNS，`ConnectivityService` 1 秒内 `VALIDATED`，`WebView` 网页浏览与 Google Play 联网正常
 - **应用生态与兼容**：官方 A16 x86_64 Google Play 服务就绪；Intel Houdini 14.0.0 经 `libhoudini_a16_shim.so` 桥接后完整支持 `arm64-v8a` 与 `armeabi-v7a`，大型 Unity ARM64 游戏（含腾讯 `libtersafe2.so`/`libtprt.so` 与数美 `libsmsdk.so` 反作弊组件）稳定运行，`0 SIGABRT` / `0 SIGSEGV`；`Android/data` 与 `Android/obb` 权限正常（`FuseDaemon: Rejected = 0`）
 

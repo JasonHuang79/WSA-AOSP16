@@ -6,7 +6,7 @@
 
 > Engineering patchset, image packing pipeline, and technical documentation for porting **Android 16 (AOSP 16 / API 36)** onto **Windows Subsystem for Android (WSA 2407)**.
 >
-> Without rebuilding AOSP from scratch, this toolkit uses verified byte-level ELF/DEX patches, targeted module grafting, an original `libhoudini_a16_shim.so` NativeBridge v8 compatibility layer, and a `debugfs` + VHDX packing pipeline to run AOSP 16 with native Windows 11 independent app windows, native WSA networking, official x86_64 Google Play Services (GApps 16), and high-performance Intel Houdini 14.0.0 (`arm64-v8a` + `armeabi-v7a`).
+> Without rebuilding AOSP from scratch, this toolkit uses verified byte-level ELF/DEX patches, targeted module grafting, an original `libhoudini_a16_shim.so` NativeBridge v8 compatibility layer, and a `debugfs` + VHDX packing pipeline to run AOSP 16 with native Windows 11 independent app windows, native WSA networking, official x86_64 Google Play Services (GApps 16), and high-performance Intel Houdini 14.0.0 (`arm64-v8a` + `armeabi-v7a`) — and to fix SurfaceView / Unity rendering in independent windows.
 
 ---
 
@@ -15,6 +15,7 @@
 | Area | Tools | Problem Solved |
 | :--- | :--- | :--- |
 | **Native Multi-Window Composition (HWC 2.4 + SF)** | [`patch_hwc_taskid.py`](tools/patches/patch_hwc_taskid.py) + [`patch_services_taskid.py`](tools/patches/patch_services_taskid.py) | Bridges AOSP 16 `SurfaceFlinger` → `hwcomposer.windows.so` via HWC 2.4 GenericMetadata `"org.chromium.arc.V1_0.TaskId"` (`METADATA_TASK_ID = 3`), restoring native Windows 11 independent freeform windows and bidirectional focus sync. |
+| **r44: Recursive Child-Layer Metadata Inheritance (SurfaceView / Unity windows)** | [`patch_sf_metadata_inherit.py`](tools/patches/patch_sf_metadata_inherit.py) | AOSP 16 `LayerSnapshotBuilder::updateMetadata` only looks keys up in the layer's own `requested.metadata` map, so a parent `Task`'s `METADATA_TASK_ID` is **never inherited** by child layers. `SurfaceView` (BLAST) layers therefore keep `mTaskId = 0` and get dropped by `hwcomposer.windows.so`'s `Layer::validate()` — Unity games and video `SurfaceView`s render blank in Windows 11 independent windows. r44 injects a register-preserving "inherit-then-merge" helper into a `.text` code cave and repoints all 3 snapshot paths' GenericMetadata lookup from `requested.metadata` to `snapshot.layerMetadata`. |
 | **WSA Shell & Notification Bridge** | [`build_systemui_wsa.py`](tools/patches/build_systemui_wsa.py) | Grafts `WsaTaskManager`, `Shell`, and `Notification` RCM channels onto stock A16 `SystemUI.apk` (isolating bundled `com/google/protobuf/` in-place to `com/google/protobuw/`), bringing **5/5 Binder services** and **25/25 RCM channels** online. |
 | **Duplicate Caption Bar Removal** | [`patch_systemui_nocaption.py`](tools/patches/patch_systemui_nocaption.py) | Patches `CaptionWindowDecorViewModel.shouldShowWindowDecor$1` to return `false`, eliminating the redundant AOSP 16 inner freeform caption bar beneath the native Windows 11 title bar. |
 | **Native WSA Networking & A16 System Fixes** | [`build_services_wsa.py`](tools/patches/build_services_wsa.py) + [`patch_systemapp.py`](tools/patches/patch_systemapp.py) + [`patch_userapp.py`](tools/patches/patch_userapp.py) | Clean-room A16 `WsaLaunchParamsModifier`; `SystemApp` P5 surgically NOPs `setNetworkCapabilities` (keeping `EthernetManager.updateConfiguration()` intact while bypassing A16 `EthernetServiceImpl.enforceAutomotiveDevice()`, restoring native `eth0` IPv4/DNS and `VALIDATED` connectivity); fixes A16's 6-arg `OnOpNotedListener` and adds `UserApp` `ACTION_MAIN` desktop fallback. |
@@ -43,6 +44,7 @@ WSA-AOSP16/
     │   └── vhdx_fuse_ro.py                  # Pure-Python FUSE3 zero-copy read-only VHDX mounter
     ├── patches/
     │   ├── patch_hwc_taskid.py              # hwcomposer.windows.so ELF patch (TaskId passthrough)
+    │   ├── patch_sf_metadata_inherit.py     # r44: SurfaceFlinger child-layer METADATA_TASK_ID inheritance
     │   ├── build_services_wsa.py            # A16 services.jar + WsaLaunchParamsModifier builder
     │   ├── patch_services_taskid.py         # WindowStateAnimator.createSurfaceLocked TaskId patch
     │   ├── build_systemui_wsa.py            # A16 SystemUI.apk WSA Shell/Notification grafter
@@ -86,6 +88,12 @@ Extract stock `hwcomposer.windows.so`, `services.jar`, `SystemUI.apk`, `SystemAp
 python3 tools/patches/patch_hwc_taskid.py \
   --input hwcomposer.windows.so \
   --output hwcomposer.windows.patched.so
+
+# 1b) r44: patch A16 system/bin/surfaceflinger (recursive child-layer
+#     METADATA_TASK_ID inheritance; fixes Unity / SurfaceView blank windows)
+python3 tools/patches/patch_sf_metadata_inherit.py \
+  --input surfaceflinger \
+  --output surfaceflinger.patched
 
 # 2) Build & patch A16 services.jar (WsaLaunchParamsModifier + METADATA_TASK_ID)
 python3 tools/patches/build_services_wsa.py \
@@ -187,6 +195,7 @@ sudo bash tools/pack/pack_houdini_shim.sh \
 - **Cold boot**: ~`18s – 26s` to `sys.boot_completed=1`, zero `HeartbeatTimeout`, zero `FATAL EXCEPTION` / `Fatal signal`
 - **WSA host integration**: 5/5 Binder services online, 25/25 RCM channels connected (`Composition`, `Shell`, `Notification`, `TSF` IME, `Clipboard`, `Audio`, etc.)
 - **Windowing & IME**: Native Windows 11 independent freeform windows with single title bar, native host IME (TSF), and one-click Start Menu desktop launcher
+- **r44 child-layer rendering**: `SurfaceView` (BLAST) layers and Unity games now render inside independent windows. `LayerSnapshotBuilder` recursively propagates the parent container's `METADATA_TASK_ID` to every child layer, so no layer is dropped with `mTaskId = 0`
 - **Networking & WebView**: `eth0` receives IPv4/GW/DNS automatically on boot, reaching `VALIDATED` in <1s; WebView browsing and Google Play connectivity work out of the box
 - **App ecosystem**: Official API 36 x86_64 Google Play Services ready; Intel Houdini 14.0.0 bridged via `libhoudini_a16_shim.so` runs both `arm64-v8a` and `armeabi-v7a` apps stably — including demanding Unity ARM64 titles with anti-cheat SDKs (`libtersafe2.so`, `libtprt.so`, `libsmsdk.so`) at `0 SIGABRT` / `0 SIGSEGV`; full `/Android/data` & `/Android/obb` access (`FuseDaemon: Rejected = 0`)
 
